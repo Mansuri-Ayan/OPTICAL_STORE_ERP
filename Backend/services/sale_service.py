@@ -1,0 +1,1593 @@
+# Service: sale_service.py
+"""
+Business logic for Sales: atomic creation with inventory sync,
+split payments, cancellation with inventory reversal.
+"""
+from datetime import datetime, timezone
+from decimal import Decimal
+from sqlalchemy import select, update, func as sa_func
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
+from fastapi import HTTPException, status
+
+from models.sale import Sale, SaleStatus, StaffType
+from models.sale_item import SaleItem
+from models.sale_payment import SalePayment, SalePaymentMethod
+from models.product import Product
+from models.inventory import Inventory, OwnerType
+from models.inventory_transaction import InventoryTransaction, TransactionType
+from models.customer import Customer, CustomerMembershipTier # Import CustomerMembershipTier
+from models.loyalty_config import LoyaltyConfig # Import LoyaltyConfig
+from models.store_category_loyalty import StoreCategoryLoyalty # Import StoreCategoryLoyalty
+from models.loyalty_transaction import LoyaltyTransaction, LoyaltyTransactionType # Import LoyaltyTransaction and Type
+from services.inventory_service import get_or_create_inventory
+from services import loyalty_service # Import loyalty_service
+from services import customer_link_service # Import customer_link_service
+from services.snapshot_service import capture_product_snapshot
+from services.product_unit_service import assign_units_to_sale_item, restore_units_from_sale_item
+from models.prescription import Prescription
+
+from schemas.sale import (
+    SaleCreate,
+    SaleUpdate,
+    SalePaymentCreate,
+)
+
+
+# ── Helpers ────────────────────────────────────────────────────
+
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _compute_line_total(
+    qty: int,
+    unit_price: Decimal,
+    tax_pct: Decimal,
+    discount_pct: Decimal,
+) -> Decimal:
+    """(unit_price × qty) × (1 - discount/100) × (1 + tax/100)"""
+    base = unit_price * qty
+    after_discount = base * (Decimal("1") - discount_pct / Decimal("100"))
+    with_tax = after_discount * (Decimal("1") + tax_pct / Decimal("100"))
+    return with_tax.quantize(Decimal("0.01"))
+
+
+async def _generate_invoice_number(db: AsyncSession, admin_id: int) -> str:
+    """Auto-generate a unique sequential invoice number like INV-2026-00001."""
+    year = datetime.now(timezone.utc).year
+    prefix = f"INV-{year}-"
+    stmt = (
+        select(Sale.invoice_number)
+        .where(Sale.invoice_number.like(f"{prefix}%"))
+        .order_by(Sale.invoice_number.desc())
+        .limit(1)
+    )
+    result = await db.execute(stmt)
+    last_inv = result.scalar_one_or_none()
+
+    next_seq = 1
+    if last_inv:
+        try:
+            suffix = last_inv.split(prefix)[-1]
+            next_seq = int(suffix) + 1
+        except (ValueError, IndexError):
+            count_stmt = select(sa_func.count()).select_from(Sale).where(
+                Sale.invoice_number.like(f"{prefix}%")
+            )
+            next_seq = (await db.execute(count_stmt)).scalar_one() + 1
+
+    while True:
+        candidate = f"{prefix}{next_seq:05d}"
+        exists_stmt = select(sa_func.count()).select_from(Sale).where(
+            Sale.invoice_number == candidate
+        )
+        exists = (await db.execute(exists_stmt)).scalar_one()
+        if exists == 0:
+            return candidate
+        next_seq += 1
+
+
+# ── Create Sale ───────────────────────────────────────────────
+
+async def create_sale(
+    db: AsyncSession,
+    admin_id: int,
+    payload: SaleCreate,
+) -> Sale:
+    """
+    Create a sale atomically: sale record + items + payments.
+    For each item:
+      - Stores unit_cost from product.cost_price at sale time
+      - Creates InventoryTransaction(SALE) and decrements inventory
+    Auto-computes totals and determines payment status.
+    """
+    invoice_number = await _generate_invoice_number(db, admin_id)
+
+    # Build sale items
+    subtotal = Decimal("0")
+    total_discount = Decimal("0")
+    total_tax = Decimal("0")
+    sale_items: list[SaleItem] = []
+    has_lenses = False
+
+    for item_data in payload.items:
+        # Fetch product for cost_price snapshot
+        prod_stmt = select(Product).options(selectinload(Product.category)).where(Product.id == item_data.product_id)
+        prod_result = await db.execute(prod_stmt)
+        product = prod_result.scalar_one_or_none()
+        if not product:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Product {item_data.product_id} not found",
+            )
+
+        if product.category and product.category.name.lower() == "lenses":
+            has_lenses = True
+
+        tax_percent = item_data.tax_percent
+        if tax_percent is None:
+            from services.gst_service import resolve_gst_percent
+            tax_percent = await resolve_gst_percent(db, item_data.product_id, admin_id)
+
+        line_total = _compute_line_total(
+            item_data.quantity,
+            item_data.unit_price,
+            tax_percent,
+            item_data.discount_percent,
+        )
+        base = item_data.unit_price * item_data.quantity
+        discount_amt = base * item_data.discount_percent / Decimal("100")
+        after_discount = base - discount_amt
+        tax_amt = after_discount * tax_percent / Decimal("100")
+
+        subtotal += base
+        total_discount += discount_amt
+        total_tax += tax_amt
+
+        # Capture an immutable snapshot of the product at sale time
+        snapshot = await capture_product_snapshot(db, product)
+
+        # For optical orders (where each physical unit requires individual lab processing & QC inspection),
+        # expand quantity > 1 into individual 1-unit items so QC is strictly tracked at the item level.
+        if not getattr(payload, "is_direct_sale", False) and item_data.quantity > 1:
+            unit_line_total = (line_total / Decimal(str(item_data.quantity))).quantize(Decimal("0.01"))
+            remaining_line_total = line_total
+            for u_idx in range(item_data.quantity):
+                is_last = (u_idx == item_data.quantity - 1)
+                cur_line_total = remaining_line_total if is_last else unit_line_total
+                remaining_line_total -= cur_line_total
+
+                sale_item = SaleItem(
+                    product_id=item_data.product_id,
+                    product_snapshot_id=snapshot.id,
+                    inventory_id=item_data.inventory_id,
+                    deadstock_item_id=getattr(item_data, "deadstock_item_id", None),
+                    quantity=1,
+                    unit_price=item_data.unit_price,
+                    unit_cost=product.cost_price,  # snapshot at sale time
+                    discount_percent=item_data.discount_percent,
+                    tax_percent=tax_percent,
+                    line_total=cur_line_total,
+                    notes=item_data.notes,
+                )
+                sale_items.append((sale_item, product, snapshot, item_data))
+        else:
+            sale_item = SaleItem(
+                product_id=item_data.product_id,
+                product_snapshot_id=snapshot.id,
+                inventory_id=item_data.inventory_id,
+                deadstock_item_id=getattr(item_data, "deadstock_item_id", None),
+                quantity=item_data.quantity,
+                unit_price=item_data.unit_price,
+                unit_cost=product.cost_price,  # snapshot at sale time
+                discount_percent=item_data.discount_percent,
+                tax_percent=tax_percent,
+                line_total=line_total,
+                notes=item_data.notes,
+            )
+            sale_items.append((sale_item, product, snapshot, item_data))
+
+    # Validate manual discount amount
+    if payload.discount_amount > subtotal:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Discount cannot exceed the total selling price (subtotal)",
+        )
+
+    if payload.discount_amount:
+        total_discount += payload.discount_amount
+
+    if getattr(payload, "deadstock_deduction", None):
+        total_discount += payload.deadstock_deduction
+
+    total_amount = (subtotal - total_discount + total_tax).quantize(Decimal("0.01"))
+
+    # Unpack items tuple — service builds (SaleItem, Product, ProductSnapshot, SaleItemCreate) quads
+    sale_items_unpacked = [si for si, _p, _s, _d in sale_items]
+
+    # Build payments
+    sale_payments: list[SalePayment] = []
+    paid_amount = Decimal("0")
+    loyalty_points_redeemed = 0
+    is_full_payment_claim = False
+
+    for pay_data in payload.payments:
+        if pay_data.payment_method == SalePaymentMethod.LOYALTY_POINTS:
+            loyalty_points_redeemed += int(pay_data.amount)
+
+        if getattr(pay_data, "remarks", "") == "Full payment":
+            is_full_payment_claim = True
+
+        sale_payment = SalePayment(
+            amount=pay_data.amount,
+            payment_method=pay_data.payment_method,
+            reference_number=pay_data.reference_number,
+            remarks=pay_data.remarks,
+        )
+        sale_payments.append(sale_payment)
+        paid_amount += pay_data.amount
+
+    if is_full_payment_claim or paid_amount >= total_amount:
+        paid_amount = total_amount
+        due_amount = Decimal("0.00")
+        sale_status = SaleStatus.COMPLETED
+        if sale_payments and is_full_payment_claim:
+            sale_payments[0].amount = total_amount
+    else:
+        due_amount = (total_amount - paid_amount).quantize(Decimal("0.01"))
+        if due_amount <= 0:
+            sale_status = SaleStatus.COMPLETED
+        elif paid_amount > 0:
+            sale_status = SaleStatus.PARTIALLY_PAID
+        else:
+            sale_status = SaleStatus.PENDING
+
+    customer_id_for_sale = payload.customer_id
+
+    if customer_id_for_sale is None:
+        if payload.new_customer_details:
+            # Create a new customer
+            new_customer_data = payload.new_customer_details
+            new_customer = Customer(
+                admin_id=admin_id,
+                store_id=payload.store_id, # New customer is associated with the store where sale happens
+                first_visit_store_id=payload.store_id,
+                first_name=new_customer_data.first_name,
+                last_name=new_customer_data.last_name,
+                phone=new_customer_data.phone,
+                email=new_customer_data.email,
+                gender=new_customer_data.gender,
+                date_of_birth=new_customer_data.date_of_birth,
+                address=new_customer_data.address,
+                city=new_customer_data.city,
+                state=new_customer_data.state,
+                pincode=new_customer_data.pincode,
+                remark=new_customer_data.remark,
+                is_active=True,
+            )
+            db.add(new_customer)
+            await db.flush() # Get the ID for the new customer
+            customer_id_for_sale = new_customer.id
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Either an existing customer_id or new_customer_details must be provided for the sale."
+            )
+    else:
+        # Validate existing customer_id
+        existing_customer = await db.scalar(
+            select(Customer).where(Customer.id == customer_id_for_sale, Customer.admin_id == admin_id)
+        )
+        if not existing_customer:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Customer with ID {customer_id_for_sale} not found or does not belong to this admin."
+            )
+        # If customer_id is provided and valid, ensure new_customer_details is not also provided
+        if payload.new_customer_details:
+             raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Cannot provide both an existing customer_id and new_customer_details."
+            )
+    
+    # Resolve prescription and initial lab status
+    prescription_id = payload.prescription_id
+    if not prescription_id and customer_id_for_sale:
+        pres_stmt = (
+            select(Prescription)
+            .where(
+                Prescription.customer_id == customer_id_for_sale,
+                Prescription.is_active == True
+            )
+            .order_by(Prescription.created_at.desc())
+            .limit(1)
+        )
+        active_pres = (await db.execute(pres_stmt)).scalar_one_or_none()
+        if active_pres:
+            prescription_id = active_pres.id
+
+    # Determine initial_lab_status (Direct Sale vs Order-Based Sale)
+    is_direct = getattr(payload, "is_direct_sale", None)
+    if is_direct is True:
+        for _si, p, _s, _d in sale_items:
+            if getattr(p, "sales_workflow_type", "BOTH") == "ORDER_ONLY":
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Product '{p.name}' is marked as Order-Based Sale only and cannot be sold via Instant Direct Sale."
+                )
+        initial_lab_status = None
+    elif is_direct is False:
+        initial_lab_status = "Confirmed"
+    else:
+        has_order_only = any(
+            (p.category and p.category.name.lower() == "lenses") or
+            getattr(p, "sales_workflow_type", "BOTH") == "ORDER_ONLY"
+            for _si, p, _s, _d in sale_items
+        )
+        if has_lenses or has_order_only or payload.prescription_id:
+            initial_lab_status = "Confirmed"
+        else:
+            initial_lab_status = None
+
+    # Resolve per-item processing_type and initial qc_status
+    for sale_item, p, _s, _d in sale_items:
+        p_wf = getattr(p, "sales_workflow_type", "BOTH")
+        is_lens = bool(p.category and p.category.name.lower() == "lenses")
+
+        if p_wf == "DIRECT_ONLY":
+            item_proc = "DIRECT"
+        elif p_wf == "ORDER_ONLY" or is_lens:
+            item_proc = "ORDER"
+        else:
+            # BOTH: follows cart/order-level processing
+            item_proc = "ORDER" if initial_lab_status is not None else "DIRECT"
+
+        sale_item.processing_type = item_proc
+
+        if initial_lab_status is None:
+            # Pure Direct Sale: bypasses lab & QC pipeline, delivered immediately on checkout
+            sale_item.qc_status = "DELIVERED"
+            sale_item.resolution_status = "RESOLVED"
+        else:
+            # Order-Based or Mixed Order: all items start at PENDING_QC_PRE_LAB for inspection.
+            # Direct items bypass lab once QC check passes!
+            sale_item.qc_status = "PENDING_QC_PRE_LAB"
+            sale_item.resolution_status = "UNRESOLVED"
+
+    if initial_lab_status is None and due_amount <= 0:
+        sale_status = SaleStatus.COMPLETED
+
+    sale = Sale(
+        invoice_number=invoice_number,
+        admin_id=admin_id,
+        store_id=payload.store_id,
+        customer_id=customer_id_for_sale, # Use the determined customer_id
+        billing_account_customer_id=payload.billing_account_customer_id,
+        loyalty_awarded_to_customer_id=payload.loyalty_awarded_to_customer_id,
+        loyalty_redeemed_from_customer_id=payload.loyalty_redeem_customer_id,
+        sold_by_type=payload.sold_by_type,
+        sold_by_id=payload.sold_by_id,
+        sale_date=payload.sale_date,
+        status=sale_status,
+        subtotal=subtotal.quantize(Decimal("0.01")),
+        discount_amount=total_discount.quantize(Decimal("0.01")),
+        tax_amount=total_tax.quantize(Decimal("0.01")),
+        total_amount=total_amount,
+        paid_amount=paid_amount.quantize(Decimal("0.01")),
+        due_amount=max(due_amount, Decimal("0")),
+        loyalty_points_earned=0,
+        loyalty_points_redeemed=0,
+        notes=payload.notes,
+        items=sale_items_unpacked,
+        payments=sale_payments,
+        prescription_id=prescription_id,
+        lab_status=initial_lab_status,
+    )
+    db.add(sale)
+    await db.flush()  # Get sale.id before loyalty operations
+
+    if payload.billing_account_customer_id and payload.billing_account_customer_id != customer_id_for_sale:
+        await customer_link_service.get_or_create_link(
+            db, admin_id, payload.store_id, customer_id_for_sale, payload.billing_account_customer_id
+        )
+
+    # --- LOYALTY INTEGRATION ---
+    if customer_id_for_sale:
+        customer = await db.scalar(select(Customer).where(Customer.id == customer_id_for_sale))
+        config = await db.scalar(select(LoyaltyConfig).where(LoyaltyConfig.store_id == payload.store_id))
+        category_loyalties = (await db.execute(select(StoreCategoryLoyalty).where(StoreCategoryLoyalty.store_id == payload.store_id))).scalars().all()
+
+        if not customer or not config:
+            raise HTTPException(status_code=500, detail="Loyalty config or customer missing")
+
+        # Skip all loyalty operations if program is disabled
+        if getattr(config, "is_enabled", True):
+            # Step 1: Co-Redemption (Self + Other Customer B)
+            rupee_discount_self = Decimal("0.00")
+            rupee_discount_other = Decimal("0.00")
+            points_redeemed_self = 0
+            points_redeemed_other = 0
+
+            pts_self = payload.points_to_redeem_self
+            pts_other = payload.points_to_redeem_other
+            if pts_self == 0 and pts_other == 0 and payload.points_to_redeem > 0:
+                pts_self = payload.points_to_redeem
+
+            # Validate Self Redemption
+            if pts_self > 0:
+                res_self = await loyalty_service.validate_redemption(
+                    customer_current_points=customer.current_points,
+                    points_to_redeem=pts_self,
+                    sale_total=total_amount,
+                    config=config
+                )
+                if not res_self["valid"]:
+                    raise HTTPException(status_code=400, detail=f"Self redemption error: {res_self['error']}")
+                points_redeemed_self = res_self["points_redeemed"]
+                rupee_discount_self = res_self["rupee_discount"]
+
+            # Validate Other Redemption
+            # Block self-redemption: cannot redeem from the buyer as "other customer"
+            if (payload.loyalty_redeem_other_customer_id and
+                    payload.loyalty_redeem_other_customer_id == customer_id_for_sale):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Cannot redeem points from the same customer who is buying. "
+                           "Use the standard redemption field instead."
+                )
+
+            other_customer = None
+            if pts_other > 0 and payload.loyalty_redeem_other_customer_id:
+                # ── OTP Verification Guard for Other Customer Points ────────
+                from services.loyalty_otp_service import verify_loyalty_token
+                is_otp_valid = verify_loyalty_token(
+                    payload.loyalty_verification_token,
+                    payload.loyalty_redeem_other_customer_id,
+                    pts_other,
+                )
+                if not is_otp_valid:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Loyalty points redemption for another customer requires valid OTP verification from the account owner.",
+                    )
+
+                other_customer = await db.scalar(
+                    select(Customer).where(Customer.id == payload.loyalty_redeem_other_customer_id)
+                )
+                if not other_customer:
+                    raise HTTPException(status_code=404, detail="Other loyalty customer not found")
+                res_other = await loyalty_service.validate_redemption(
+                    customer_current_points=other_customer.current_points,
+                    points_to_redeem=pts_other,
+                    sale_total=total_amount,
+                    config=config
+                )
+                points_redeemed_other = res_other["points_redeemed"]
+                rupee_discount_other = res_other["rupee_discount"]
+
+                # Mark OTP record as used so token cannot be reused for a future sale
+                if payload.loyalty_verification_token:
+                    from models.otp_verification import OTPVerification
+                    await db.execute(
+                        update(OTPVerification)
+                        .where(OTPVerification.verification_token == payload.loyalty_verification_token)
+                        .values(is_used=True)
+                    )
+
+            # Apply combined capping logic
+            max_discount_pct = getattr(config, "max_redemption_percentage", 100)
+            max_total_discount = (total_amount * Decimal(str(max_discount_pct)) / Decimal("100")).quantize(Decimal("0.01"))
+            
+            total_requested_discount = rupee_discount_self + rupee_discount_other
+            if total_requested_discount > max_total_discount:
+                if rupee_discount_self >= max_total_discount:
+                    rupee_discount_self = max_total_discount
+                    points_redeemed_self = int(rupee_discount_self * config.points_per_rupee)
+                    rupee_discount_other = Decimal("0.00")
+                    points_redeemed_other = 0
+                else:
+                    rupee_discount_other = max_total_discount - rupee_discount_self
+                    points_redeemed_other = int(rupee_discount_other * config.points_per_rupee)
+
+            # Process Self points deduction
+            if points_redeemed_self > 0:
+                customer.current_points -= points_redeemed_self
+                customer.loyalty_points_redeemed += points_redeemed_self
+                db.add(customer)
+
+                db.add(LoyaltyTransaction(
+                    customer_id=customer.id,
+                    store_id=payload.store_id,
+                    sale_id=sale.id,
+                    type=LoyaltyTransactionType.REDEEMED,
+                    points=-points_redeemed_self,
+                    rupee_value=rupee_discount_self
+                ))
+
+            # Process Other points deduction
+            if points_redeemed_other > 0 and other_customer:
+                other_customer.current_points -= points_redeemed_other
+                other_customer.loyalty_points_redeemed += points_redeemed_other
+                db.add(other_customer)
+
+                db.add(LoyaltyTransaction(
+                    customer_id=other_customer.id,
+                    store_id=payload.store_id,
+                    sale_id=sale.id,
+                    type=LoyaltyTransactionType.REDEEMED,
+                    points=-points_redeemed_other,
+                    rupee_value=rupee_discount_other
+                ))
+
+            # Set fields on Sale record
+            sale.loyalty_redeemed_other_customer_id = payload.loyalty_redeem_other_customer_id
+            sale.loyalty_points_redeemed_self = points_redeemed_self
+            sale.loyalty_points_redeemed_other = points_redeemed_other
+            sale.loyalty_points_redeemed = points_redeemed_self + points_redeemed_other
+
+            # Adjust sale totals for redemption discount
+            # Folded into discount_amount (not just total_amount) so the invoice
+            # breakdown (subtotal - discount_amount + tax_amount = total_amount)
+            # stays reconciled, and so process_partial_return's later recalculation
+            # doesn't silently drop the redemption discount without refunding points.
+            total_discount_from_redemption = rupee_discount_self + rupee_discount_other
+            sale.discount_amount += total_discount_from_redemption
+            sale.total_amount -= total_discount_from_redemption
+            sale.due_amount = max(Decimal("0"), sale.total_amount - sale.paid_amount)
+            if sale.due_amount <= 0:
+                sale.status = SaleStatus.COMPLETED
+
+            # Step 2: Earning
+            earn_customer_id = payload.loyalty_awarded_to_customer_id or customer_id_for_sale
+            if earn_customer_id != customer.id:
+                earn_customer = await db.scalar(select(Customer).where(Customer.id == earn_customer_id))
+                if not earn_customer:
+                    raise HTTPException(status_code=404, detail="Loyalty award customer not found")
+            else:
+                earn_customer = customer
+                
+            sale_items_dict = [{"category_id": item.product_id, "quantity": item.quantity} for item, _p, _s, _d in sale_items]
+            # Reuse already-fetched products instead of re-querying
+            product_map = {p.id: p for _si, p, _s, _d in sale_items}
+            for item_dict in sale_items_dict:
+                prod = product_map.get(item_dict["category_id"])
+                item_dict["category_id"] = prod.category_id if prod else item_dict["category_id"]
+
+            # Use updated total_amount for price points calculation
+            earn_res = await loyalty_service.calculate_points_for_sale(
+                sale_total=sale.total_amount,
+                sale_items=sale_items_dict,
+                config=config,
+                category_loyalties=category_loyalties,
+                custom_points=payload.custom_points,
+                category_points_override=payload.category_points_enabled_override,
+                price_points_override=payload.price_points_enabled_override,
+                enabled_category_ids=payload.enabled_category_points_ids
+            )
+
+            if earn_res["category_points"] > 0:
+                db.add(LoyaltyTransaction(
+                    customer_id=earn_customer.id,
+                    store_id=payload.store_id,
+                    sale_id=sale.id,
+                    type=LoyaltyTransactionType.EARNED_CATEGORY,
+                    points=earn_res["category_points"]
+                ))
+            if earn_res["price_points"] > 0:
+                db.add(LoyaltyTransaction(
+                    customer_id=earn_customer.id,
+                    store_id=payload.store_id,
+                    sale_id=sale.id,
+                    type=LoyaltyTransactionType.EARNED_PRICE,
+                    points=earn_res["price_points"]
+                ))
+            if earn_res["custom_points"] > 0:
+                db.add(LoyaltyTransaction(
+                    customer_id=earn_customer.id,
+                    store_id=payload.store_id,
+                    sale_id=sale.id,
+                    type=LoyaltyTransactionType.EARNED_CUSTOM,
+                    points=earn_res["custom_points"],
+                    given_by_type=payload.sold_by_type.value,
+                    given_by_id=payload.sold_by_id
+                ))
+
+            total_earned = earn_res["total_points"]
+            earn_customer.current_points += total_earned
+            earn_customer.loyalty_points_earned += total_earned
+            sale.loyalty_points_earned = total_earned
+            
+            earn_customer.membership_tier = loyalty_service.get_tier(earn_customer.current_points, config)
+            if earn_customer_id != customer.id:
+                db.add(earn_customer)
+            else:
+                db.add(customer)
+
+    # Decrement inventory for each item using FIFO
+    for sale_item, product, snapshot, item_data in sale_items:
+        owner_type_enum = OwnerType.STORE
+        owner_id = payload.store_id
+        
+        # Query active inventory rows sorted by id
+        inv_stmt = select(Inventory).where(
+            Inventory.product_id == sale_item.product_id,
+            Inventory.owner_type == owner_type_enum.value,
+            Inventory.owner_id == owner_id,
+            Inventory.available_quantity > 0,
+            Inventory.is_active.is_(True)
+        ).order_by(Inventory.id.asc())
+        
+        inv_result = await db.execute(inv_stmt)
+        batches = list(inv_result.scalars().all())
+        
+        total_available = sum(b.available_quantity for b in batches)
+        if total_available < sale_item.quantity:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    f"Insufficient stock for product {sale_item.product_id}: "
+                    f"available={total_available}, "
+                    f"requested={sale_item.quantity}"
+                ),
+            )
+            
+        qty_to_consume = sale_item.quantity
+        consumed_list = []
+        tot_purchase_cost = Decimal("0.00")
+        
+        for batch in batches:
+            if qty_to_consume <= 0:
+                break
+            taken = min(batch.available_quantity, qty_to_consume)
+            batch.quantity -= taken
+            batch.available_quantity -= taken
+            batch.last_stock_out_at = _now()
+            # Keep batch active even when quantity reaches 0 so it remains visible
+            # in out-of-stock listings.
+            
+            consumed_list.append({
+                "inventory_id": batch.id,
+                "quantity": taken,
+                "purchase_cost": float(batch.purchase_cost)
+            })
+            tot_purchase_cost += Decimal(taken) * batch.purchase_cost
+            qty_to_consume -= taken
+            
+        sale_item.inventory_id = consumed_list[0]["inventory_id"]
+        sale_item.unit_cost = Decimal(consumed_list[0]["purchase_cost"])
+        sale_item.total_purchase_cost = tot_purchase_cost
+        sale_item.consumed_batches = consumed_list
+        
+        # Add inventory transaction
+        txn = InventoryTransaction(
+            inventory_id=sale_item.inventory_id,
+            product_id=sale_item.product_id,
+            product_snapshot_id=snapshot.id,
+            unit_price=sale_item.unit_price,
+            total_value=sale_item.line_total,
+            transaction_type=TransactionType.SALE,
+            quantity=sale_item.quantity,
+            reference_id=sale.id,
+            remarks=f"Sale {invoice_number}",
+            created_by=payload.sold_by_id,
+            consumed_batches=consumed_list,
+        )
+        db.add(txn)
+        await db.flush()
+
+        # Phase 1: Assign specific units (if any) or FIFO available units (skip if deadstock item checkout)
+        if not getattr(item_data, "deadstock_item_id", None):
+            await assign_units_to_sale_item(
+                db=db,
+                product_id=sale_item.product_id,
+                owner_type=owner_type_enum,
+                owner_id=owner_id,
+                quantity=sale_item.quantity,
+                sale_item_id=sale_item.id,
+                specific_unit_skus=getattr(item_data, "unit_skus", None)
+            )
+
+        # Mark deadstock item as SOLD if applicable
+        if getattr(item_data, "deadstock_item_id", None):
+            from services.deadstock_service import mark_deadstock_sold
+            await mark_deadstock_sold(db, item_data.deadstock_item_id, sale.id)
+
+
+
+    await db.commit()
+    from services.bill_service import update_bill_for_sale
+    await update_bill_for_sale(db, sale.id)
+    stmt = (
+        select(Sale)
+        .options(
+            selectinload(Sale.items).selectinload(SaleItem.assigned_units),
+            selectinload(Sale.payments),
+            selectinload(Sale.store),
+            selectinload(Sale.customer),
+        )
+        .where(Sale.id == sale.id)
+    )
+    result = await db.execute(stmt)
+    return result.scalar_one()
+
+
+# ── Read Sales ────────────────────────────────────────────────
+
+async def get_sale(
+    db: AsyncSession,
+    sale_id: int,
+) -> Sale | None:
+    """Fetch a sale by ID with items and payments eagerly loaded."""
+    stmt = (
+        select(Sale)
+        .options(
+            selectinload(Sale.items).selectinload(SaleItem.assigned_units),
+            selectinload(Sale.items).selectinload(SaleItem.product_snapshot),
+            selectinload(Sale.items).selectinload(SaleItem.product),
+            selectinload(Sale.payments),
+        )
+        .where(Sale.id == sale_id)
+    )
+    result = await db.execute(stmt)
+    sale = result.scalar_one_or_none()
+    if sale and sale.lab_status:
+        needs_split = any(item.quantity > 1 for item in sale.items)
+        if needs_split:
+            for item in list(sale.items):
+                if item.quantity > 1:
+                    orig_qty = item.quantity
+                    orig_total = item.line_total
+                    unit_total = (orig_total / Decimal(str(orig_qty))).quantize(Decimal("0.01"))
+                    item.quantity = 1
+                    item.line_total = orig_total - (unit_total * Decimal(str(orig_qty - 1)))
+                    db.add(item)
+                    for _ in range(orig_qty - 1):
+                        new_item = SaleItem(
+                            sale_id=sale.id,
+                            product_id=item.product_id,
+                            product_snapshot_id=item.product_snapshot_id,
+                            inventory_id=item.inventory_id,
+                            deadstock_item_id=item.deadstock_item_id,
+                            quantity=1,
+                            unit_price=item.unit_price,
+                            unit_cost=item.unit_cost,
+                            discount_percent=item.discount_percent,
+                            tax_percent=item.tax_percent,
+                            line_total=unit_total,
+                            notes=item.notes,
+                            processing_type=getattr(item, "processing_type", "ORDER") or "ORDER",
+                            qc_status="PENDING_QC_PRE_LAB",
+                            resolution_status="UNRESOLVED",
+                        )
+                        db.add(new_item)
+            await db.commit()
+            result = await db.execute(stmt)
+            sale = result.scalar_one_or_none()
+    return sale
+
+
+async def list_sales(
+    db: AsyncSession,
+    admin_id: int,
+    store_id: int | None = None,
+    customer_id: int | None = None,
+    status_filter: str | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    search: str | None = None,
+    page: int = 1,
+    limit: int = 20,
+    paginate: bool = True,
+    has_due: bool | None = None,
+    is_lab_order: bool | None = None,
+    tab: str | None = None,
+    lab_status_filter: str | None = None,
+) -> tuple[list[Sale], int]:
+    """List sales for an admin with optional filters, search, and pagination."""
+    from models.customer import Customer
+    from models.sale_item import SaleItem
+    from models.product import Product
+    from sqlalchemy import exists, or_
+
+    conditions = [Sale.admin_id == admin_id]
+    if store_id:
+        conditions.append(Sale.store_id == store_id)
+    if customer_id:
+        conditions.append(Sale.customer_id == customer_id)
+
+    if is_lab_order is True:
+        # A sale is a lab order if it has an associated lab_status
+        conditions.append(Sale.lab_status.is_not(None))
+        conditions.append(Sale.lab_status != "Delivered")
+        conditions.append(Sale.lab_status != "Cancelled")
+        conditions.append(Sale.status != SaleStatus.CANCELLED)
+        
+        if not search:
+            if tab == "queue":
+                conditions.append(Sale.lab_status.in_(["Confirmed", "Advance Paid", "Waiting For Lab", "Processing"]))
+            elif tab == "pending":
+                conditions.append(Sale.lab_status.in_(["In Lab", "Sent To Lab", "In Production", "Quality Check"]))
+            elif tab == "ready":
+                conditions.append(Sale.lab_status.in_(["Ready For Pickup", "Customer Notified"]))
+        
+        if lab_status_filter and lab_status_filter != "All":
+            conditions.append(Sale.lab_status == lab_status_filter)
+    elif is_lab_order is False:
+        # For regular sales history: direct sales OR delivered/cancelled lab orders OR cancelled sales
+        conditions.append(or_(
+            Sale.lab_status.is_(None),
+            Sale.lab_status == "Delivered",
+            Sale.lab_status == "Cancelled",
+            Sale.status == SaleStatus.CANCELLED
+        ))
+
+        if status_filter:
+            sf = status_filter.upper().replace(" ", "_")
+            if sf == "LAB_PENDING":
+                conditions.append(Sale.status.in_([SaleStatus.PENDING, SaleStatus.PARTIALLY_PAID]))
+            elif sf == "RETURNED":
+                conditions.append(Sale.status == SaleStatus.REFUNDED)
+            elif sf == "UNPAID":
+                conditions.append(Sale.status == SaleStatus.PENDING)
+            else:
+                conditions.append(Sale.status == sf)
+    if date_from:
+        conditions.append(Sale.sale_date >= date_from)
+    if date_to:
+        conditions.append(Sale.sale_date <= date_to)
+    if has_due is not None:
+        if has_due:
+            conditions.append(Sale.due_amount > 0)
+        else:
+            conditions.append(Sale.due_amount == 0)
+
+    if search:
+        search_term = f"%{search.strip()}%"
+        invoice_cond = Sale.invoice_number.ilike(search_term)
+        
+        customer_exists = exists().where(
+            Customer.id == Sale.customer_id,
+            or_(
+                Customer.first_name.ilike(search_term),
+                Customer.last_name.ilike(search_term),
+                Customer.phone.ilike(search_term)
+            )
+        )
+        
+        product_exists = exists().where(
+            SaleItem.sale_id == Sale.id,
+            Product.id == SaleItem.product_id,
+            or_(
+                Product.name.ilike(search_term),
+                Product.sku.ilike(search_term)
+            )
+        )
+        conditions.append(or_(invoice_cond, customer_exists, product_exists))
+
+    # Count query
+    count_stmt = select(sa_func.count(Sale.id)).where(*conditions)
+    total = (await db.execute(count_stmt)).scalar() or 0
+
+    # Data query
+    stmt = (
+        select(Sale)
+        .options(
+            selectinload(Sale.items).selectinload(SaleItem.assigned_units),
+            selectinload(Sale.payments),
+            selectinload(Sale.customer),
+            selectinload(Sale.billing_account_customer),
+            selectinload(Sale.loyalty_awarded_to_customer),
+            selectinload(Sale.loyalty_redeemed_from_customer),
+            selectinload(Sale.store),
+        )
+        .where(*conditions)
+        .order_by(Sale.created_at.desc())
+    )
+
+    if paginate:
+        offset = (page - 1) * limit
+        stmt = stmt.offset(offset).limit(limit)
+
+    result = await db.execute(stmt)
+    sales = list(result.scalars().all())
+    return sales, total
+
+
+
+# ── Update Sale ───────────────────────────────────────────────
+
+async def update_sale(
+    db: AsyncSession,
+    sale: Sale,
+    payload: SaleUpdate,
+) -> Sale:
+    """Update sale header (status, notes, lab details) with concurrency & transition validation."""
+    if sale.status in (SaleStatus.CANCELLED, SaleStatus.REFUNDED):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Cannot update status for sale that is already {sale.status.value}."
+        )
+
+    update_data = payload.model_dump(exclude_unset=True)
+
+    if "lab_status" in update_data and update_data["lab_status"] != sale.lab_status:
+        if sale.lab_status == "Delivered" and update_data["lab_status"] != "Delivered":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Delivered lab orders cannot be reverted to a pending status."
+            )
+
+        # QC Gatekeeper: Verify all items have passed QC for this stage transition
+        new_lab_status = update_data["lab_status"]
+        if new_lab_status == "Delivered":
+            stmt_items = select(SaleItem).where(SaleItem.sale_id == sale.id)
+            items = (await db.execute(stmt_items)).scalars().all()
+            for it in items:
+                if getattr(it, "processing_type", "ORDER") == "DIRECT":
+                    if it.qc_status not in ("QC_PASSED_PRE_LAB", "DELIVERED", "CANCELLED"):
+                        raise HTTPException(
+                            status_code=status.HTTP_400_BAD_REQUEST,
+                            detail=f"Cannot deliver order: Direct-sale item #{it.id} has QC status '{it.qc_status}'. All direct items must complete Quality Check first.",
+                        )
+                else:
+                    if it.qc_status not in ("QC_PASSED_POST_LAB", "DELIVERED", "CANCELLED"):
+                        raise HTTPException(
+                            status_code=status.HTTP_400_BAD_REQUEST,
+                            detail=f"Cannot deliver order: Item #{it.id} has QC status '{it.qc_status}'. All items must pass Post-Lab QC first.",
+                        )
+            for it in items:
+                if it.qc_status in ("QC_PASSED_POST_LAB", "QC_PASSED_PRE_LAB"):
+                    it.qc_status = "DELIVERED"
+
+        elif new_lab_status == "Sent To Lab":
+            stmt_items = select(SaleItem).where(SaleItem.sale_id == sale.id)
+            items = (await db.execute(stmt_items)).scalars().all()
+            for it in items:
+                if getattr(it, "processing_type", "ORDER") == "DIRECT":
+                    # Direct sale items bypass the lab workflow entirely
+                    continue
+                if it.qc_status not in ("QC_PASSED_PRE_LAB", "SENT_TO_LAB", "DELIVERED", "CANCELLED"):
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail=f"Cannot send order to lab: Item #{it.id} has QC status '{it.qc_status}'. All items must pass Pre-Lab QC first.",
+                    )
+            for it in items:
+                if getattr(it, "processing_type", "ORDER") != "DIRECT" and it.qc_status == "QC_PASSED_PRE_LAB":
+                    it.qc_status = "SENT_TO_LAB"
+
+    for field, value in update_data.items():
+        setattr(sale, field, value)
+        
+    if "lab_status" in update_data and update_data["lab_status"] == "Delivered":
+        if sale.due_amount <= 0:
+            sale.status = SaleStatus.COMPLETED
+
+
+    await db.flush()
+    from services.bill_service import update_bill_for_sale
+    await update_bill_for_sale(db, sale.id, commit=False)
+    await check_and_update_sales_loss(db, sale.id, commit=False)
+    await db.commit()
+    # Re-fetch (rather than db.refresh) to keep item.product_snapshot/product
+    # eagerly loaded for the response layer — see process_partial_return for
+    # why a plain refresh() breaks serialization here.
+    return await get_sale(db, sale.id)
+
+
+async def cancel_sale(
+    db: AsyncSession,
+    sale: Sale,
+    cancelled_by: int,
+) -> Sale:
+    """
+    Cancel a sale and reverse all inventory movements.
+    Creates RETURN transactions for each item.
+    """
+    if sale.status == SaleStatus.CANCELLED:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Sale is already cancelled",
+        )
+
+    # Load items if not already loaded
+    if not sale.items:
+        sale_with_items = await get_sale(db, sale.id)
+        if sale_with_items:
+            sale = sale_with_items
+
+    # Reverse inventory for each item using batch metadata
+    for item in sale.items:
+        if item.consumed_batches:
+            for batch_meta in item.consumed_batches:
+                batch_id = batch_meta["inventory_id"]
+                qty_to_restore = batch_meta["quantity"]
+                
+                inv_stmt = select(Inventory).where(Inventory.id == batch_id)
+                inv_result = await db.execute(inv_stmt)
+                inventory = inv_result.scalar_one_or_none()
+                if inventory:
+                    inventory.quantity += qty_to_restore
+                    inventory.available_quantity += qty_to_restore
+                    inventory.last_stock_in_at = _now()
+                    inventory.is_active = True
+
+                    txn = InventoryTransaction(
+                        inventory_id=inventory.id,
+                        product_id=item.product_id,
+                        product_snapshot_id=item.product_snapshot_id,
+                        unit_price=item.unit_price,
+                        total_value=item.unit_price * qty_to_restore,
+                        transaction_type=TransactionType.RETURN,
+                        quantity=qty_to_restore,
+                        reference_id=sale.id,
+                        remarks=f"Cancellation of sale {sale.invoice_number} (batch restore)",
+                        created_by=cancelled_by,
+                        consumed_batches=[batch_meta]
+                    )
+                    db.add(txn)
+        elif item.inventory_id:
+            # Fallback for legacy sales without batch metadata
+            inv_stmt = select(Inventory).where(Inventory.id == item.inventory_id)
+            inv_result = await db.execute(inv_stmt)
+            inventory = inv_result.scalar_one_or_none()
+            if inventory:
+                inventory.quantity += item.quantity
+                inventory.available_quantity += item.quantity
+                inventory.last_stock_in_at = _now()
+                inventory.is_active = True
+
+                txn = InventoryTransaction(
+                    inventory_id=inventory.id,
+                    product_id=item.product_id,
+                    product_snapshot_id=item.product_snapshot_id,
+                    unit_price=item.unit_price,
+                    total_value=item.line_total,
+                    transaction_type=TransactionType.RETURN,
+                    quantity=item.quantity,
+                    reference_id=sale.id,
+                    remarks=f"Cancellation of sale {sale.invoice_number} (fallback restore)",
+                    created_by=cancelled_by,
+                )
+                db.add(txn)
+
+        # Phase 1: Restore assigned ProductUnit rows
+        await restore_units_from_sale_item(db=db, sale_item_id=item.id)
+
+    # --- LOYALTY REVERSAL ---
+    # 1. Reverse earned points
+    if sale.loyalty_points_earned > 0:
+        earn_customer_id = sale.loyalty_awarded_to_customer_id or sale.customer_id
+        if earn_customer_id:
+            earn_cust = await db.scalar(select(Customer).where(Customer.id == earn_customer_id))
+            if earn_cust:
+                earn_cust.current_points = max(0, earn_cust.current_points - sale.loyalty_points_earned)
+                earn_cust.loyalty_points_earned = max(0, earn_cust.loyalty_points_earned - sale.loyalty_points_earned)
+                db.add(earn_cust)
+                
+                db.add(LoyaltyTransaction(
+                    customer_id=earn_cust.id,
+                    store_id=sale.store_id,
+                    sale_id=sale.id,
+                    type=LoyaltyTransactionType.ADJUSTED,
+                    points=-sale.loyalty_points_earned,
+                    note=f"Reverse earned points for cancelled sale {sale.invoice_number}"
+                ))
+
+    # 2. Refund redeemed points (Self)
+    pts_self = getattr(sale, "loyalty_points_redeemed_self", 0)
+    if pts_self == 0 and sale.loyalty_points_redeemed > 0:
+        pts_self = sale.loyalty_points_redeemed
+    
+    if pts_self > 0:
+        self_customer_id = sale.loyalty_redeemed_from_customer_id or sale.customer_id
+        if self_customer_id:
+            self_cust = await db.scalar(select(Customer).where(Customer.id == self_customer_id))
+            if self_cust:
+                self_cust.current_points += pts_self
+                self_cust.loyalty_points_redeemed = max(0, self_cust.loyalty_points_redeemed - pts_self)
+                db.add(self_cust)
+
+                db.add(LoyaltyTransaction(
+                    customer_id=self_cust.id,
+                    store_id=sale.store_id,
+                    sale_id=sale.id,
+                    type=LoyaltyTransactionType.ADJUSTED,
+                    points=pts_self,
+                    note=f"Refund redeemed points for cancelled sale {sale.invoice_number}"
+                ))
+
+    # 3. Refund redeemed points (Other)
+    pts_other = getattr(sale, "loyalty_points_redeemed_other", 0)
+    other_customer_id = getattr(sale, "loyalty_redeemed_other_customer_id", None)
+    if pts_other > 0 and other_customer_id:
+        other_cust = await db.scalar(select(Customer).where(Customer.id == other_customer_id))
+        if other_cust:
+            other_cust.current_points += pts_other
+            other_cust.loyalty_points_redeemed = max(0, other_cust.loyalty_points_redeemed - pts_other)
+            db.add(other_cust)
+
+            db.add(LoyaltyTransaction(
+                customer_id=other_cust.id,
+                store_id=sale.store_id,
+                sale_id=sale.id,
+                type=LoyaltyTransactionType.ADJUSTED,
+                points=pts_other,
+                note=f"Refund redeemed points (other customer) for cancelled sale {sale.invoice_number}"
+            ))
+
+    sale.status = SaleStatus.CANCELLED
+    if sale.lab_status:
+        sale.lab_status = "Cancelled"
+    await db.flush()
+    from services.bill_service import update_bill_for_sale
+    await update_bill_for_sale(db, sale.id, commit=False)
+    await check_and_update_sales_loss(db, sale.id, commit=False)
+    await db.commit()
+    # Re-fetch (rather than db.refresh) to keep item.product_snapshot/product
+    # eagerly loaded for the response layer — see process_partial_return for
+    # why a plain refresh() breaks serialization here.
+    return await get_sale(db, sale.id)
+
+
+async def delete_sale(
+    db: AsyncSession,
+    sale: Sale,
+    deleted_by: int,
+) -> bool:
+    """
+    Permanently delete a sale and perform complete rollback of:
+    - Inventory batch stock
+    - Assigned ProductUnit SKUs
+    - Customer loyalty points (earned & redeemed)
+    - Sales loss expenses and bill records
+    """
+    from models.loyalty_transaction import LoyaltyTransaction
+    from models.customer import Customer
+    from models.expense import Expense
+    from models.bill import Bill
+
+    # Load full sale details
+    sale_with_items = await get_sale(db, sale.id)
+    if sale_with_items:
+        sale = sale_with_items
+
+    # 1. Reverse inventory for each item using consumed batch metadata
+    for item in (sale.items or []):
+        if item.consumed_batches:
+            for batch_meta in item.consumed_batches:
+                batch_id = batch_meta["inventory_id"]
+                qty_to_restore = batch_meta["quantity"]
+                inv_stmt = select(Inventory).where(Inventory.id == batch_id)
+                inv_result = await db.execute(inv_stmt)
+                inventory = inv_result.scalar_one_or_none()
+                if inventory:
+                    inventory.quantity += qty_to_restore
+                    inventory.available_quantity += qty_to_restore
+                    inventory.last_stock_in_at = _now()
+                    inventory.is_active = True
+
+                    txn = InventoryTransaction(
+                        inventory_id=inventory.id,
+                        product_id=item.product_id,
+                        product_snapshot_id=item.product_snapshot_id,
+                        unit_price=item.unit_price,
+                        total_value=item.unit_price * qty_to_restore,
+                        transaction_type=TransactionType.RETURN,
+                        quantity=qty_to_restore,
+                        reference_id=sale.id,
+                        remarks=f"Deletion rollback of sale {sale.invoice_number}",
+                        created_by=deleted_by,
+                        consumed_batches=[batch_meta]
+                    )
+                    db.add(txn)
+        elif item.inventory_id:
+            inv_stmt = select(Inventory).where(Inventory.id == item.inventory_id)
+            inv_result = await db.execute(inv_stmt)
+            inventory = inv_result.scalar_one_or_none()
+            if inventory:
+                inventory.quantity += item.quantity
+                inventory.available_quantity += item.quantity
+                inventory.last_stock_in_at = _now()
+                inventory.is_active = True
+
+                txn = InventoryTransaction(
+                    inventory_id=inventory.id,
+                    product_id=item.product_id,
+                    product_snapshot_id=item.product_snapshot_id,
+                    unit_price=item.unit_price,
+                    total_value=item.line_total,
+                    transaction_type=TransactionType.RETURN,
+                    quantity=item.quantity,
+                    reference_id=sale.id,
+                    remarks=f"Deletion rollback of sale {sale.invoice_number} (fallback)",
+                    created_by=deleted_by,
+                )
+                db.add(txn)
+
+        # Phase 1: Restore assigned ProductUnit rows back to AVAILABLE
+        await restore_units_from_sale_item(db=db, sale_item_id=item.id)
+
+    # 2. Reverse loyalty points & remove loyalty transactions
+    loyalty_txns_stmt = select(LoyaltyTransaction).where(LoyaltyTransaction.sale_id == sale.id)
+    loyalty_res = await db.execute(loyalty_txns_stmt)
+    loyalty_txns = list(loyalty_res.scalars().all())
+
+    for l_txn in loyalty_txns:
+        if l_txn.customer_id:
+            cust_stmt = select(Customer).where(Customer.id == l_txn.customer_id)
+            cust_res = await db.execute(cust_stmt)
+            customer = cust_res.scalar_one_or_none()
+            if customer:
+                customer.current_points -= l_txn.points
+                if l_txn.points > 0:
+                    customer.loyalty_points_earned = max(0, customer.loyalty_points_earned - l_txn.points)
+                elif l_txn.points < 0:
+                    customer.loyalty_points_redeemed = max(0, customer.loyalty_points_redeemed + l_txn.points)
+                db.add(customer)
+        await db.delete(l_txn)
+
+    # 3. Clean up associated exchanges, expenses (Sales Loss), and bills
+    from models.exchange import Exchange
+    exc_stmt = select(Exchange).where(
+        (Exchange.original_sale_id == sale.id) | (Exchange.new_sale_id == sale.id)
+    )
+    exc_res = await db.execute(exc_stmt)
+    for exc in exc_res.scalars().all():
+        await db.delete(exc)
+
+    ref_num = f"SALE-{sale.id}"
+    exp_stmt = select(Expense).where(Expense.reference_number == ref_num)
+    exp_res = await db.execute(exp_stmt)
+    for exp in exp_res.scalars().all():
+        await db.delete(exp)
+
+    bill_stmt = select(Bill).where(Bill.sale_id == sale.id)
+    bill_res = await db.execute(bill_stmt)
+    for bill in bill_res.scalars().all():
+        await db.delete(bill)
+
+    # 4. Mark sale as CANCELLED (preserving historical record in DB)
+    sale.status = SaleStatus.CANCELLED
+    await db.commit()
+    await db.refresh(sale)
+    return True
+
+
+# ── Add Payment ───────────────────────────────────────────────
+
+async def add_sale_payment(
+    db: AsyncSession,
+    sale: Sale,
+    payload: SalePaymentCreate,
+) -> SalePayment:
+    """Add a payment to an existing sale (split payments / instalments)."""
+    if sale.status == SaleStatus.CANCELLED:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot add payment to a cancelled sale",
+        )
+
+    payment = SalePayment(
+        sale_id=sale.id,
+        amount=payload.amount,
+        payment_method=payload.payment_method,
+        reference_number=payload.reference_number,
+        remarks=payload.remarks,
+    )
+    db.add(payment)
+
+    sale.paid_amount += payload.amount
+    sale.due_amount = max(sale.total_amount - sale.paid_amount, Decimal("0"))
+
+    # Update status if now fully paid
+    if sale.due_amount <= 0:
+        sale.status = SaleStatus.COMPLETED
+    elif sale.paid_amount > 0 and sale.status == SaleStatus.PENDING:
+        sale.status = SaleStatus.PARTIALLY_PAID
+
+    if payload.payment_method == SalePaymentMethod.LOYALTY_POINTS:
+        sale.loyalty_points_redeemed += int(payload.amount)
+
+    await db.flush()
+    from services.bill_service import update_bill_for_sale
+    await update_bill_for_sale(db, sale.id, commit=False)
+    await check_and_update_sales_loss(db, sale.id, commit=False)
+    await db.commit()
+    await db.refresh(payment)
+    return payment
+
+
+# ── check_and_update_sales_loss ──────────────────────────────────────
+
+async def check_and_update_sales_loss(db: AsyncSession, sale_id: int, commit: bool = True):
+    from models.sale import Sale, SaleStatus
+    from models.sale_item import SaleItem
+    from models.product import Product
+    from models.expense import Expense, ExpenseOwnerType, ExpensePaymentMethod, ExpenseRecordedByType
+    from models.expense_category import ExpenseCategory
+    from sqlalchemy.orm import selectinload
+    
+    # 1. Fetch sale with products loaded
+    stmt = (
+        select(Sale)
+        .options(
+            selectinload(Sale.items).selectinload(SaleItem.product),
+            selectinload(Sale.store)
+        )
+        .where(Sale.id == sale_id)
+    )
+    res = await db.execute(stmt)
+    sale = res.scalar_one_or_none()
+    if not sale:
+        return
+
+    # 2. Check if it should have an expense
+    should_have_expense = (
+        (sale.status == SaleStatus.COMPLETED or sale.lab_status == "Delivered")
+        and sale.status not in (SaleStatus.CANCELLED, SaleStatus.REFUNDED)
+    )
+
+    # 3. Check for existing expense
+    ref_num = f"SALE-{sale.id}"
+    exp_stmt = select(Expense).where(Expense.reference_number == ref_num, Expense.deleted_at.is_(None))
+    exp_res = await db.execute(exp_stmt)
+    existing_expense = exp_res.scalar_one_or_none()
+
+    if not should_have_expense:
+        if existing_expense:
+            await db.delete(existing_expense)
+            await db.commit()
+        return
+
+    # 4. Calculate total loss
+    total_loss = Decimal("0.00")
+    loss_details = []
+    
+    for item in sale.items:
+        unit_cost = item.unit_cost or Decimal("0.00")
+        unit_price = item.unit_price or Decimal("0.00")
+        quantity = item.quantity or 0
+        if quantity <= 0:
+            continue
+            
+        # Calculate proportionate manual discount
+        item_base_total = unit_price * quantity
+        proportionate_manual_discount = Decimal("0.00")
+        if sale.subtotal > 0 and sale.discount_amount > 0:
+            proportionate_manual_discount = sale.discount_amount * (item_base_total / sale.subtotal)
+            
+        item_line_discount = item_base_total * (item.discount_percent or Decimal("0.00")) / Decimal("100")
+        total_item_discount = item_line_discount + proportionate_manual_discount
+        
+        # Final unit selling price after all discounts
+        final_selling_price = unit_price - (total_item_discount / quantity)
+        
+        # Determine total cost for this item
+        total_cost = item.total_purchase_cost if item.total_purchase_cost is not None else (unit_cost * quantity)
+        
+        # Loss formula: Total Cost Price - Final Selling Price Total
+        item_loss = total_cost - (final_selling_price * quantity)
+        
+        if item_loss > 0:
+            total_loss += item_loss
+            prod_name = item.product.name if item.product else f"Product #{item.product_id}"
+            sku = item.product.sku if item.product else "N/A"
+            loss_details.append(
+                f"- {prod_name} (SKU: {sku}): Qty={quantity}, Total Cost=₹{total_cost:.2f}, "
+                f"Selling (after disc)=₹{(final_selling_price * quantity):.2f}, Loss=₹{item_loss:.2f}"
+            )
+
+    # 5. Handle creation or deletion based on loss amount
+    if total_loss <= 0:
+        if existing_expense:
+            await db.delete(existing_expense)
+            if commit:
+                await db.commit()
+            else:
+                await db.flush()
+        return
+
+    # Resolve "Sales Loss" category
+    cat_stmt = select(ExpenseCategory).where(
+        ExpenseCategory.admin_id == sale.admin_id,
+        ExpenseCategory.name == "Sales Loss"
+    )
+    cat_res = await db.execute(cat_stmt)
+    loss_category = cat_res.scalar_one_or_none()
+    
+    if not loss_category:
+        loss_category = ExpenseCategory(
+            admin_id=sale.admin_id,
+            name="Sales Loss",
+            description="Automatically generated category for tracking sales losses",
+            is_active=True
+        )
+        db.add(loss_category)
+        await db.flush()
+
+    title = f"Sales Loss - Invoice #{sale.invoice_number}"
+    description = (
+        f"Automatic loss calculation for Invoice #{sale.invoice_number}.\n"
+        f"Store: {sale.store.store_name if sale.store else f'Store #{sale.store_id}'}\n\n"
+        "Loss details by item:\n" + "\n".join(loss_details)
+    )
+
+    if existing_expense:
+        existing_expense.category_id = loss_category.id
+        existing_expense.title = title
+        existing_expense.description = description
+        existing_expense.amount = total_loss.quantize(Decimal("0.01"))
+        existing_expense.expense_date = sale.sale_date
+        existing_expense.is_approved = True
+    else:
+        new_expense = Expense(
+            admin_id=sale.admin_id,
+            owner_type=ExpenseOwnerType.STORE,
+            owner_id=sale.store_id,
+            category_id=loss_category.id,
+            title=title,
+            description=description,
+            amount=total_loss.quantize(Decimal("0.01")),
+            expense_date=sale.sale_date,
+            payment_method=ExpensePaymentMethod.CASH,
+            is_approved=True,
+            recorded_by_type=ExpenseRecordedByType(sale.sold_by_type.value),
+            recorded_by_id=sale.sold_by_id,
+            reference_number=ref_num
+        )
+        db.add(new_expense)
+
+    if commit:
+        await db.commit()
+    else:
+        await db.flush()
+
+
+# ── Partial Return ─────────────────────────────────────────────
+
+async def process_partial_return(
+    db: AsyncSession,
+    sale_id: int,
+    payload: "SalePartialReturnRequest",
+    processed_by: int,
+) -> Sale:
+    """
+    Process partial return of a sale:
+    - Restores inventory batch quantities.
+    - Frees product units.
+    - Adjusts sale totals and item quantities.
+    """
+    from schemas.sale import SalePartialReturnRequest
+
+    sale = await get_sale(db, sale_id)
+    if not sale:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Sale {sale_id} not found"
+        )
+    
+    if sale.status in (SaleStatus.CANCELLED, SaleStatus.REFUNDED):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Cannot partially return a {sale.status.value} sale"
+        )
+
+    # Convert request items to dict
+    return_reqs = {req.sale_item_id: req for req in payload.items}
+
+    for item in sale.items:
+        if item.id not in return_reqs:
+            continue
+        
+        req = return_reqs[item.id]
+        if req.quantity > item.quantity:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Cannot return {req.quantity} of item {item.id}, only {item.quantity} sold"
+            )
+        
+        # 1. Restore ProductUnits (if any)
+        if getattr(req, "unit_skus", None):
+            await restore_units_from_sale_item(db=db, sale_item_id=item.id, specific_unit_skus=req.unit_skus)
+        else:
+            # We don't have a specific subset of unit SKUs to restore, 
+            # so we'll let a service handle restoring 'N' units if needed, 
+            # but currently restore_units_from_sale_item restores all if no SKUs passed. 
+            # Wait, we need a way to restore N units? Yes, for partial return we need to restore exact quantity.
+            # I will just call restore_units_from_sale_item with limit in a custom query if specific_unit_skus is None
+            from models.product_unit import ProductUnit, UnitStatus
+            from sqlalchemy import select
+            
+            stmt = select(ProductUnit).where(ProductUnit.sale_item_id == item.id).limit(req.quantity)
+            res = await db.execute(stmt)
+            units_to_restore = res.scalars().all()
+            for u in units_to_restore:
+                u.status = UnitStatus.AVAILABLE
+                u.sale_item_id = None
+                u.sold_at = None
+
+        # 2. Restore Inventory batches
+        qty_to_restore_batch = req.quantity
+        if item.consumed_batches:
+            # We restore to the most recently consumed batches first
+            # But they are stored in order of consumption (FIFO)
+            # We can reverse the list to restore to the newest batch first
+            for batch_meta in reversed(item.consumed_batches):
+                if qty_to_restore_batch <= 0:
+                    break
+                batch_id = batch_meta["inventory_id"]
+                # We can restore up to the amount that was taken from this batch
+                taken_from_batch = batch_meta["quantity"]
+                restore_amt = min(taken_from_batch, qty_to_restore_batch)
+
+                inv_stmt = select(Inventory).where(Inventory.id == batch_id)
+                inv_result = await db.execute(inv_stmt)
+                inventory = inv_result.scalar_one_or_none()
+                if inventory:
+                    inventory.quantity += restore_amt
+                    inventory.available_quantity += restore_amt
+                    inventory.last_stock_in_at = _now()
+                    inventory.is_active = True
+                
+                    txn = InventoryTransaction(
+                        inventory_id=inventory.id,
+                        product_id=item.product_id,
+                        product_snapshot_id=item.product_snapshot_id,
+                        unit_price=item.unit_price,
+                        total_value=item.unit_price * restore_amt,
+                        transaction_type=TransactionType.RETURN,
+                        quantity=restore_amt,
+                        reference_id=sale.id,
+                        remarks=f"Partial return {req.quantity} on sale {sale.invoice_number}",
+                        created_by=processed_by,
+                    )
+                    db.add(txn)
+                
+                # Update batch metadata to reflect the return
+                batch_meta["quantity"] -= restore_amt
+                qty_to_restore_batch -= restore_amt
+                
+            # Filter out batches that were fully returned
+            item.consumed_batches = [b for b in item.consumed_batches if b["quantity"] > 0]
+        
+        # 3. Update Sale Item totals
+        item.quantity -= req.quantity
+        item.line_total = _compute_line_total(
+            item.quantity,
+            item.unit_price,
+            item.tax_percent,
+            item.discount_percent,
+        )
+
+    # Recalculate Sale totals
+    sale.subtotal = sum(i.unit_price * i.quantity for i in sale.items)
+    sale.tax_amount = sum(
+        ((i.unit_price * i.quantity) - ((i.unit_price * i.quantity) * i.discount_percent / Decimal("100"))) 
+        * i.tax_percent / Decimal("100") 
+        for i in sale.items
+    )
+    # Re-apply proportional manual discount? Or keep manual discount as is?
+    # For now keep sale.discount_amount as is, unless it exceeds new subtotal.
+    if sale.discount_amount > sale.subtotal:
+        sale.discount_amount = sale.subtotal
+        
+    sale.total_amount = (sale.subtotal - sale.discount_amount + sale.tax_amount).quantize(Decimal("0.01"))
+    sale.due_amount = max(Decimal("0"), sale.total_amount - sale.paid_amount)
+    
+    if sale.due_amount <= 0 and sale.total_amount > 0:
+        sale.status = SaleStatus.COMPLETED
+        
+    if sale.total_amount <= 0:
+        sale.status = SaleStatus.REFUNDED
+
+    await db.flush()
+    from services.bill_service import update_bill_for_sale
+    await update_bill_for_sale(db, sale.id, commit=False)
+    await check_and_update_sales_loss(db, sale.id, commit=False)
+    await db.commit()
+    # Re-fetch (rather than db.refresh) to keep item.product_snapshot/product
+    # eagerly loaded for the response layer — a plain refresh() expires those
+    # relationships, and re-loading them lazily outside an async-aware context
+    # raises sqlalchemy.exc.MissingGreenlet during response serialization.
+    return await get_sale(db, sale.id)

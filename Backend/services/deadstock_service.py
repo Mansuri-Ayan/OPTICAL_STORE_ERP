@@ -1,0 +1,490 @@
+# Service: deadstock_service.py
+from datetime import datetime, timezone
+from decimal import Decimal
+from sqlalchemy import select, and_, or_, func as sa_func
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
+from fastapi import HTTPException, status
+
+from models.deadstock_item import DeadstockItem, DeadstockStatus
+from models.exchange import Exchange
+from models.sale_item import SaleItem
+from models.product import Product
+from models.inventory import Inventory, OwnerType
+from models.inventory_transaction import InventoryTransaction, TransactionType
+from services.inventory_service import get_or_create_inventory
+from services.snapshot_service import capture_product_snapshot
+
+
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+async def create_deadstock_from_exchange(
+    db: AsyncSession,
+    exchange: Exchange,
+    original_item: SaleItem,
+    exchange_qty: int,
+    admin_id: int,
+    store_id: int,
+) -> list[DeadstockItem]:
+    """
+    Create DeadstockItem record(s) for exchanged product line.
+    Creates 1 record per unit (quantity=1 each) for individual unit tracking.
+    """
+    product = await db.scalar(select(Product).where(Product.id == original_item.product_id))
+    if not product:
+        category_name = "Other"
+        sku = "UNKNOWN"
+        unit_price = Decimal("0.00")
+    else:
+        category_name = product.category.name if product.category else "Other"
+        sku = product.sku
+        unit_price = (original_item.line_total / Decimal(original_item.quantity)).quantize(Decimal("0.01")) if original_item.quantity else product.selling_price
+
+    # Fetch physical units linked to the original sale item
+    from models.product_unit import ProductUnit, UnitStatus
+    res_units = await db.execute(
+        select(ProductUnit)
+        .where(ProductUnit.sale_item_id == original_item.id)
+        .limit(exchange_qty)
+    )
+    product_units = list(res_units.scalars().all())
+
+    created_items = []
+    for i in range(exchange_qty):
+        unit_id = None
+        if i < len(product_units):
+            unit = product_units[i]
+            unit.status = UnitStatus.DEADSTOCK
+            unit.sale_item_id = None
+            unit.sold_at = None
+            unit_id = unit.id
+
+        ds_item = DeadstockItem(
+            admin_id=admin_id,
+            store_id=store_id,
+            product_id=original_item.product_id,
+            inventory_id=original_item.inventory_id,
+            exchange_id=exchange.id,
+            original_sale_item_id=original_item.id,
+            sku=sku,
+            category_name=category_name,
+            quantity=1,
+            original_price=unit_price,
+            status=DeadstockStatus.AVAILABLE,
+            is_exchanged=True,
+            product_unit_id=unit_id,
+            notes=f"Exchanged from invoice {exchange.original_sale.invoice_number if exchange.original_sale else 'N/A'} (EXC: {exchange.exchange_number})",
+        )
+        db.add(ds_item)
+        created_items.append(ds_item)
+
+    await db.flush()
+    return created_items
+
+
+async def get_deadstock_item(db: AsyncSession, item_id: int) -> DeadstockItem | None:
+    stmt = (
+        select(DeadstockItem)
+        .options(
+            selectinload(DeadstockItem.product).selectinload(Product.category),
+            selectinload(DeadstockItem.product).selectinload(Product.brand),
+            selectinload(DeadstockItem.exchange),
+            selectinload(DeadstockItem.store),
+            selectinload(DeadstockItem.original_sale_item),
+        )
+        .where(DeadstockItem.id == item_id)
+    )
+    res = await db.execute(stmt)
+    return res.scalar_one_or_none()
+
+
+async def list_deadstock(
+    db: AsyncSession,
+    admin_id: int,
+    store_id: int | None = None,
+    category: str | None = None,
+    status_filter: str | None = None,
+    search: str | None = None,
+    page: int = 1,
+    limit: int = 20,
+    paginate: bool = True,
+) -> tuple[list[DeadstockItem], int, dict]:
+    """
+    List deadstock items with filters, search, pagination, and category counts.
+    """
+    base_conditions = [DeadstockItem.admin_id == admin_id]
+    if store_id:
+        base_conditions.append(DeadstockItem.store_id == store_id)
+
+    # Calculate category counts across all deadstock items in scope
+    count_stmt = (
+        select(
+            DeadstockItem.category_name,
+            sa_func.count(DeadstockItem.id)
+        )
+        .where(*base_conditions)
+        .group_by(DeadstockItem.category_name)
+    )
+    cat_res = await db.execute(count_stmt)
+    cat_counts = {row[0].lower(): row[1] for row in cat_res.all()}
+
+    total_all = sum(cat_counts.values())
+    counts_dict = {
+        "frames_count": cat_counts.get("frames", 0),
+        "lenses_count": cat_counts.get("lenses", 0),
+        "accessories_count": cat_counts.get("accessories", 0),
+        "other_count": total_all - (cat_counts.get("frames", 0) + cat_counts.get("lenses", 0) + cat_counts.get("accessories", 0)),
+        "total_count": total_all,
+    }
+
+    # Applied query conditions
+    query_conditions = list(base_conditions)
+    if category and category.lower() != "all":
+        query_conditions.append(sa_func.lower(DeadstockItem.category_name) == category.lower())
+
+    if status_filter and status_filter.lower() != "all":
+        query_conditions.append(DeadstockItem.status == status_filter.upper())
+
+    if search:
+        s = f"%{search.strip()}%"
+        # Search by SKU, category, notes, or product name
+        prod_exists = select(Product.id).where(
+            Product.id == DeadstockItem.product_id,
+            Product.name.ilike(s)
+        ).exists()
+
+        query_conditions.append(
+            or_(
+                DeadstockItem.sku.ilike(s),
+                DeadstockItem.category_name.ilike(s),
+                DeadstockItem.notes.ilike(s),
+                prod_exists
+            )
+        )
+
+    # Total matching query count
+    total_stmt = select(sa_func.count(DeadstockItem.id)).where(*query_conditions)
+    total_matching = (await db.execute(total_stmt)).scalar() or 0
+
+    # Data query
+    stmt = (
+        select(DeadstockItem)
+        .options(
+            selectinload(DeadstockItem.product).selectinload(Product.category),
+            selectinload(DeadstockItem.product).selectinload(Product.brand),
+            selectinload(DeadstockItem.exchange),
+            selectinload(DeadstockItem.store),
+            selectinload(DeadstockItem.original_sale_item),
+            selectinload(DeadstockItem.product_unit),
+        )
+        .where(*query_conditions)
+        .order_by(DeadstockItem.created_at.desc())
+    )
+
+    if paginate:
+        offset = (page - 1) * limit
+        stmt = stmt.offset(offset).limit(limit)
+
+    res = await db.execute(stmt)
+    items = list(res.scalars().all())
+
+    # Enrich item objects with denormalized fields
+    for item in items:
+        if item.product:
+            item.product_name = item.product.name
+            item.brand_name = item.product.brand.name if item.product.brand else "Generic"
+        if item.store:
+            item.store_name = item.store.store_name
+        if item.exchange:
+            item.exchange_number = item.exchange.exchange_number
+            if item.exchange.original_sale:
+                item.original_invoice_number = item.exchange.original_sale.invoice_number
+        if item.product_unit:
+            item.unit_sku = item.product_unit.unit_sku
+
+    return items, total_matching, counts_dict
+
+
+async def reuse_deadstock(
+    db: AsyncSession,
+    item_id: int,
+    admin_id: int,
+    user_id: int | None = None,
+    store_id: int | None = None,
+) -> tuple[DeadstockItem, Inventory]:
+    """
+    Reuse a deadstock item (frames/accessories):
+    1. Validates status is AVAILABLE.
+    2. Moves 1 unit back into regular store/admin inventory (adds to quantity & available_quantity).
+    3. Creates an InventoryTransaction(PURCHASE/RETURN).
+    4. Sets deadstock item status to REUSED, is_exchanged to False, and updates reused_at.
+    """
+    ds_item = await get_deadstock_item(db, item_id)
+    if not ds_item:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Deadstock item not found.",
+        )
+
+    if ds_item.admin_id != admin_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Not authorized to access this deadstock item.",
+        )
+
+    if store_id is not None and ds_item.store_id != store_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Not authorized to access this deadstock item.",
+        )
+
+    if ds_item.status != DeadstockStatus.AVAILABLE:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Deadstock item cannot be reused because it is currently {ds_item.status.value}.",
+        )
+
+    # Restore 1 unit to store inventory
+    inventory = await get_or_create_inventory(
+        db, "STORE", ds_item.store_id, ds_item.product_id
+    )
+
+    inventory.quantity += ds_item.quantity
+    inventory.available_quantity += ds_item.quantity
+    inventory.last_stock_in_at = _now()
+    inventory.is_active = True
+
+    # Capture snapshot
+    product = await db.scalar(select(Product).where(Product.id == ds_item.product_id))
+    snapshot = await capture_product_snapshot(db, product)
+
+    # Record inventory transaction
+    txn = InventoryTransaction(
+        inventory_id=inventory.id,
+        product_id=ds_item.product_id,
+        product_snapshot_id=snapshot.id,
+        unit_price=ds_item.original_price,
+        total_value=ds_item.original_price * ds_item.quantity,
+        transaction_type=TransactionType.PURCHASE,
+        quantity=ds_item.quantity,
+        reference_id=ds_item.id,
+        remarks=f"Reused from Deadstock (SKU: {ds_item.sku})",
+        created_by=user_id or admin_id,
+    )
+    db.add(txn)
+
+    # Update deadstock status
+    ds_item.status = DeadstockStatus.REUSED
+    ds_item.is_exchanged = False
+    ds_item.reused_at = _now()
+
+    if ds_item.product_unit_id:
+        from models.product_unit import ProductUnit, UnitStatus
+        unit = await db.scalar(select(ProductUnit).where(ProductUnit.id == ds_item.product_unit_id))
+        if unit:
+            unit.status = UnitStatus.AVAILABLE
+            unit.inventory_batch_id = inventory.id
+            unit.owner_type = inventory.owner_type
+            unit.owner_id = inventory.owner_id
+
+    await db.commit()
+    await db.refresh(ds_item)
+    return ds_item, inventory
+
+
+async def batch_reuse_deadstock(
+    db: AsyncSession,
+    item_ids: list[int],
+    admin_id: int,
+    user_id: int | None = None,
+    store_id: int | None = None,
+) -> tuple[int, Inventory | None]:
+    """
+    Reuse multiple deadstock items (belonging to the same product or batch) at once:
+    Restores total quantity directly to active store/admin inventory.
+    """
+    reused_count = 0
+    last_inventory = None
+    for item_id in item_ids:
+        try:
+            ds_item, inventory = await reuse_deadstock(
+                db=db,
+                item_id=item_id,
+                admin_id=admin_id,
+                user_id=user_id,
+                store_id=store_id,
+            )
+            reused_count += 1
+            last_inventory = inventory
+        except Exception as e:
+            print(f"Skipping deadstock item {item_id} during batch reuse: {e}")
+            continue
+
+    return reused_count, last_inventory
+
+
+async def list_deadstock_for_pos(
+    db: AsyncSession,
+    admin_id: int,
+    store_id: int,
+    category: str | None = None,
+) -> list[DeadstockItem]:
+    """
+    List AVAILABLE deadstock items for POS product selection step.
+    """
+    conditions = [
+        DeadstockItem.admin_id == admin_id,
+        DeadstockItem.store_id == store_id,
+        DeadstockItem.status == DeadstockStatus.AVAILABLE,
+    ]
+
+    if category and category.lower() != "all":
+        conditions.append(sa_func.lower(DeadstockItem.category_name) == category.lower())
+
+    stmt = (
+        select(DeadstockItem)
+        .options(
+            selectinload(DeadstockItem.product).selectinload(Product.category),
+            selectinload(DeadstockItem.product).selectinload(Product.brand),
+            selectinload(DeadstockItem.exchange),
+            selectinload(DeadstockItem.product_unit),
+        )
+        .where(*conditions)
+        .order_by(DeadstockItem.created_at.desc())
+    )
+
+    res = await db.execute(stmt)
+    items = list(res.scalars().all())
+
+    for item in items:
+        if item.product:
+            item.product_name = item.product.name
+            item.brand_name = item.product.brand.name if item.product.brand else "Generic"
+        if item.exchange:
+            item.exchange_number = item.exchange.exchange_number
+        if item.product_unit:
+            item.unit_sku = item.product_unit.unit_sku
+
+    return items
+
+
+async def mark_deadstock_sold(
+    db: AsyncSession,
+    item_id: int,
+    sale_id: int,
+) -> DeadstockItem:
+    """
+    Mark a deadstock item as SOLD when selected and paid for in POS.
+    """
+    ds_item = await db.scalar(select(DeadstockItem).where(DeadstockItem.id == item_id))
+    if not ds_item:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Deadstock item {item_id} not found.",
+        )
+
+    ds_item.status = DeadstockStatus.SOLD
+    ds_item.is_exchanged = False
+    ds_item.sold_in_sale_id = sale_id
+
+    if ds_item.product_unit_id:
+        from models.product_unit import ProductUnit, UnitStatus
+        from models.sale_item import SaleItem
+        unit = await db.scalar(select(ProductUnit).where(ProductUnit.id == ds_item.product_unit_id))
+        if unit:
+            unit.status = UnitStatus.SOLD
+            # Try to associate with the SaleItem in this sale
+            s_item = await db.scalar(
+                select(SaleItem).where(SaleItem.sale_id == sale_id, SaleItem.product_id == ds_item.product_id).limit(1)
+            )
+            if s_item:
+                unit.sale_item_id = s_item.id
+            unit.sold_at = sa_func.now()
+
+    await db.flush()
+    return ds_item
+
+
+async def cancel_deadstock_for_exchange(
+    db: AsyncSession,
+    exchange_id: int,
+) -> None:
+    """
+    Remove or invalidate deadstock items created by an exchange if the exchange is cancelled.
+    """
+    stmt = select(DeadstockItem).where(DeadstockItem.exchange_id == exchange_id)
+    res = await db.execute(stmt)
+    items = res.scalars().all()
+    for item in items:
+        if item.product_unit_id:
+            from models.product_unit import ProductUnit, UnitStatus
+            unit = await db.scalar(select(ProductUnit).where(ProductUnit.id == item.product_unit_id))
+            if unit:
+                unit.status = UnitStatus.SOLD
+                unit.sale_item_id = item.original_sale_item_id
+                unit.sold_at = sa_func.now()
+        await db.delete(item)
+    await db.flush()
+
+
+async def restock_returned_unit(
+    db: AsyncSession,
+    original_item: SaleItem,
+    exchange_qty: int,
+    admin_id: int,
+    store_id: int,
+) -> None:
+    """
+    Restore returned unit(s) directly to available inventory (restocked)
+    instead of creating deadstock items, because the batch is not expired.
+    """
+    from models.product_unit import ProductUnit, UnitStatus
+    from models.inventory import Inventory
+    from models.inventory_transaction import InventoryTransaction, TransactionType, TransactionStatus
+
+    # 1. Fetch physical units linked to the original sale item
+    res_units = await db.execute(
+        select(ProductUnit)
+        .where(ProductUnit.sale_item_id == original_item.id)
+        .limit(exchange_qty)
+    )
+    product_units = list(res_units.scalars().all())
+
+    # 2. Fetch the original inventory batch
+    batch = await db.scalar(
+        select(Inventory).where(Inventory.id == original_item.inventory_id)
+    )
+
+    if batch:
+        # Increment quantity
+        batch.quantity += exchange_qty
+        batch.available_quantity += exchange_qty
+        db.add(batch)
+
+        # Create InventoryTransaction(EXCHANGE_IN) for audit trail
+        tx = InventoryTransaction(
+            inventory_id=batch.id,
+            product_id=batch.product_id,
+            owner_type=batch.owner_type,
+            owner_id=batch.owner_id,
+            transaction_type=TransactionType.EXCHANGE_IN,
+            quantity=exchange_qty,
+            unit_price=batch.purchase_cost,
+            total_amount=batch.purchase_cost * exchange_qty,
+            status=TransactionStatus.COMPLETED,
+            remarks=f"Direct restock from exchange of original sale item {original_item.id}",
+        )
+        db.add(tx)
+
+    # 3. Release and restore units
+    for i in range(exchange_qty):
+        if i < len(product_units):
+            unit = product_units[i]
+            unit.status = UnitStatus.AVAILABLE
+            unit.sale_item_id = None
+            unit.sold_at = None
+            db.add(unit)
+
+    await db.flush()

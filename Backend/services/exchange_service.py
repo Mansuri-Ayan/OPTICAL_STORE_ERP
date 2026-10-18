@@ -1,0 +1,657 @@
+# Service: exchange_service.py
+from datetime import datetime, timezone, date
+from decimal import Decimal
+from sqlalchemy import select, and_, or_, func as sa_func
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
+from fastapi import HTTPException, status
+
+from models.exchange import Exchange, ExchangeStatus
+from models.sale import Sale, SaleStatus, StaffType
+from models.sale_item import SaleItem
+from models.sale_payment import SalePayment, SalePaymentMethod
+from models.product import Product
+from models.inventory import Inventory
+from models.inventory_transaction import InventoryTransaction, TransactionType
+from services.inventory_service import get_or_create_inventory
+from services.snapshot_service import capture_product_snapshot
+from services.bill_service import update_bill_for_sale
+from services.product_unit_service import restore_units_from_sale_item, assign_units_to_sale_item
+from models.inventory import OwnerType
+from schemas.exchange import ExchangeCreate
+from services.deadstock_service import (
+    create_deadstock_from_exchange,
+    cancel_deadstock_for_exchange,
+    restock_returned_unit,
+)
+
+
+
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _compute_line_total(
+    qty: int,
+    unit_price: Decimal,
+    tax_pct: Decimal,
+    discount_pct: Decimal,
+) -> Decimal:
+    """(unit_price × qty) × (1 - discount/100) × (1 + tax/100)"""
+    base = unit_price * qty
+    after_discount = base * (Decimal("1") - discount_pct / Decimal("100"))
+    with_tax = after_discount * (Decimal("1") + tax_pct / Decimal("100"))
+    return with_tax.quantize(Decimal("0.01"))
+
+
+async def _generate_exchange_number(db: AsyncSession, admin_id: int) -> str:
+    """Auto-generate a unique sequential exchange number like EXC-2026-00001."""
+    year = datetime.now(timezone.utc).year
+    prefix = f"EXC-{year}-"
+    stmt = (
+        select(Exchange.exchange_number)
+        .where(Exchange.exchange_number.like(f"{prefix}%"))
+        .order_by(Exchange.exchange_number.desc())
+        .limit(1)
+    )
+    result = await db.execute(stmt)
+    last_exc = result.scalar_one_or_none()
+
+    next_seq = 1
+    if last_exc:
+        try:
+            suffix = last_exc.split(prefix)[-1]
+            next_seq = int(suffix) + 1
+        except (ValueError, IndexError):
+            count_stmt = select(sa_func.count()).select_from(Exchange).where(
+                Exchange.exchange_number.like(f"{prefix}%")
+            )
+            next_seq = (await db.execute(count_stmt)).scalar_one() + 1
+
+    while True:
+        candidate = f"{prefix}{next_seq:05d}"
+        exists_stmt = select(sa_func.count()).select_from(Exchange).where(
+            Exchange.exchange_number == candidate
+        )
+        exists = (await db.execute(exists_stmt)).scalar_one()
+        if exists == 0:
+            return candidate
+        next_seq += 1
+
+
+async def _generate_invoice_number(db: AsyncSession, admin_id: int) -> str:
+    """Auto-generate a unique sequential invoice number like INV-2026-00001."""
+    year = datetime.now(timezone.utc).year
+    prefix = f"INV-{year}-"
+    stmt = (
+        select(Sale.invoice_number)
+        .where(Sale.invoice_number.like(f"{prefix}%"))
+        .order_by(Sale.invoice_number.desc())
+        .limit(1)
+    )
+    result = await db.execute(stmt)
+    last_inv = result.scalar_one_or_none()
+
+    next_seq = 1
+    if last_inv:
+        try:
+            suffix = last_inv.split(prefix)[-1]
+            next_seq = int(suffix) + 1
+        except (ValueError, IndexError):
+            count_stmt = select(sa_func.count()).select_from(Sale).where(
+                Sale.invoice_number.like(f"{prefix}%")
+            )
+            next_seq = (await db.execute(count_stmt)).scalar_one() + 1
+
+    while True:
+        candidate = f"{prefix}{next_seq:05d}"
+        exists_stmt = select(sa_func.count()).select_from(Sale).where(
+            Sale.invoice_number == candidate
+        )
+        exists = (await db.execute(exists_stmt)).scalar_one()
+        if exists == 0:
+            return candidate
+        next_seq += 1
+
+
+async def create_exchange(
+    db: AsyncSession,
+    admin_id: int,
+    payload: ExchangeCreate,
+) -> Exchange:
+    """
+    Atomically process an inventory exchange:
+    1. Validates original sale & item.
+    2. Enforces replacement items total >= exchange credit.
+    3. Restores returned item back to inventory (EXCHANGE_IN).
+    4. Creates a new completed Sale for replacement items using exchange credit as discount.
+    5. Deducts inventory for new items (EXCHANGE_OUT).
+    6. Stores Exchange mapping.
+    """
+    # ── 1. Validate Original Sale ──
+    sale_stmt = (
+        select(Sale)
+        .options(selectinload(Sale.items))
+        .where(Sale.id == payload.original_sale_id, Sale.admin_id == admin_id)
+    )
+    sale_res = await db.execute(sale_stmt)
+    original_sale = sale_res.scalar_one_or_none()
+    if not original_sale:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Original sale not found.",
+        )
+    if original_sale.status in (SaleStatus.CANCELLED, SaleStatus.REFUNDED):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Cannot exchange from a {original_sale.status.value.lower()} sale.",
+        )
+
+    # ── 2. Validate Original Sale Item(s) ──
+    returned_items_map = {}
+    if payload.returned_items:
+        for r_item in payload.returned_items:
+            returned_items_map[r_item.sale_item_id] = r_item.quantity
+    elif payload.original_sale_item_ids:
+        for target_id in payload.original_sale_item_ids:
+            returned_items_map[target_id] = None
+    elif payload.original_sale_item_id:
+        returned_items_map[payload.original_sale_item_id] = None
+
+    if not returned_items_map:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No original sale items selected for exchange.",
+        )
+
+    original_items = []
+    for target_id, req_qty in returned_items_map.items():
+        found_item = None
+        for item in original_sale.items:
+            if item.id == target_id:
+                found_item = item
+                break
+        if not found_item:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Item {target_id} not found in the original sale.",
+            )
+
+        # Check existing COMPLETED exchanges for this sale item to track already exchanged quantity
+        existing_exc_stmt = select(Exchange).where(
+            Exchange.original_sale_item_id == found_item.id,
+            Exchange.status == ExchangeStatus.COMPLETED,
+        )
+        existing_exc_res = await db.execute(existing_exc_stmt)
+        existing_excs = existing_exc_res.scalars().all()
+
+        unit_value = (found_item.line_total / Decimal(found_item.quantity)).quantize(Decimal("0.01"))
+        total_already_exchanged_credit = sum(exc.original_item_value for exc in existing_excs)
+        already_exchanged_qty = int(round(total_already_exchanged_credit / unit_value)) if unit_value > 0 else 0
+
+        remaining_qty = found_item.quantity - already_exchanged_qty
+
+        if remaining_qty <= 0:
+            item_name = found_item.product.name if getattr(found_item, 'product', None) else f"ID {found_item.id}"
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Item '{item_name}' has already been fully exchanged.",
+            )
+
+        if req_qty is None or req_qty > remaining_qty:
+            exchange_qty = remaining_qty
+        else:
+            exchange_qty = req_qty
+
+        if exchange_qty <= 0:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid exchange quantity for item.",
+            )
+
+        # Pro-rated credit calculation based on exchange_qty
+        item_credit = (unit_value * Decimal(exchange_qty)).quantize(Decimal("0.01"))
+        original_items.append((found_item, exchange_qty, item_credit))
+
+    # ── 3. Financial calculations ──
+    exchange_credit = sum(credit for _, _, credit in original_items)
+    
+    # Replacement items
+    new_subtotal = Decimal("0")
+    new_total_discount = Decimal("0")
+    new_total_tax = Decimal("0")
+    new_items_total = Decimal("0")
+    sale_items_to_create = []
+
+    for new_item in payload.new_items:
+        prod_stmt = select(Product).where(Product.id == new_item.product_id)
+        prod_res = await db.execute(prod_stmt)
+        product = prod_res.scalar_one_or_none()
+        if not product:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Replacement product {new_item.product_id} not found.",
+            )
+
+        line_total = _compute_line_total(
+            new_item.quantity,
+            new_item.unit_price,
+            new_item.tax_percent,
+            new_item.discount_percent,
+        )
+        base = new_item.unit_price * new_item.quantity
+        disc_amt = base * new_item.discount_percent / Decimal("100")
+        after_disc = base - disc_amt
+        tax_amt = after_disc * new_item.tax_percent / Decimal("100")
+
+        new_subtotal += base
+        new_total_discount += disc_amt
+        new_total_tax += tax_amt
+        new_items_total += line_total
+
+        # Product Snapshot
+        snapshot = await capture_product_snapshot(db, product)
+
+        sale_item = SaleItem(
+            product_id=new_item.product_id,
+            product_snapshot_id=snapshot.id,
+            inventory_id=new_item.inventory_id,
+            quantity=new_item.quantity,
+            unit_price=new_item.unit_price,
+            unit_cost=product.cost_price,
+            discount_percent=new_item.discount_percent,
+            tax_percent=new_item.tax_percent,
+            line_total=line_total,
+            notes=new_item.notes,
+        )
+        sale_items_to_create.append((sale_item, product, snapshot))
+
+    # Enforce minimum rule: new_items_total >= exchange_credit
+    if new_items_total < exchange_credit:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"Exchange rejected: Replacement items total value (₹{new_items_total:.2f}) "
+                f"must be greater than or equal to the exchanged item value (₹{exchange_credit:.2f})."
+            ),
+        )
+
+    additional_payment = new_items_total - exchange_credit
+
+    # Validate additional payment coverage
+    payment_sum = sum(p.amount for p in payload.payments)
+    if payment_sum < additional_payment:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"Additional payment of ₹{additional_payment:.2f} is required, "
+                f"but only ₹{payment_sum:.2f} was provided."
+            ),
+        )
+
+    # ── 4. Returned items go to DEADSTOCK (handled in step 6) ──
+    # NOTE: We do NOT increment active inventory here. Exchanged items are
+    # placed into deadstock (inactive). Inventory is only restored when
+    # a deadstock item is explicitly "Reused" from the deadstock page.
+    # This prevents double-counting: once via EXCHANGE_IN and again via
+    # deadstock reuse PURCHASE.
+
+    # ── 5. Create new Sale for replacement items ──
+    new_invoice = await _generate_invoice_number(db, admin_id)
+    
+    # Store-level discount amount includes the exchange credit
+    sale_discount_amount = exchange_credit
+    sale_total_amount = max(new_items_total - exchange_credit, Decimal("0"))
+    
+    new_payments = []
+    for pay_data in payload.payments:
+        payment = SalePayment(
+            amount=pay_data.amount,
+            payment_method=pay_data.payment_method,
+            reference_number=pay_data.reference_number,
+            remarks=pay_data.remarks,
+        )
+        new_payments.append(payment)
+
+    # Map staff type safely for DB enum compatibility (sales.sold_by_type enum constraint)
+    valid_sale_staff_types = [StaffType.MANAGER, StaffType.WORKER, StaffType.OPTICIAN, "MANAGER", "WORKER", "OPTICIAN"]
+    sold_by_type_val = payload.processed_by_type if payload.processed_by_type in valid_sale_staff_types else StaffType.MANAGER
+
+    sale_items_unpacked = [si for si, _p, _s in sale_items_to_create]
+
+    new_sale = Sale(
+        invoice_number=new_invoice,
+        admin_id=admin_id,
+        store_id=payload.store_id,
+        customer_id=payload.customer_id,
+        sold_by_type=sold_by_type_val,
+        sold_by_id=payload.processed_by_id,
+        sale_date=payload.exchange_date,
+        status=SaleStatus.COMPLETED,
+        subtotal=new_subtotal.quantize(Decimal("0.01")),
+        discount_amount=sale_discount_amount.quantize(Decimal("0.01")),
+        tax_amount=new_total_tax.quantize(Decimal("0.01")),
+        total_amount=sale_total_amount.quantize(Decimal("0.01")),
+        paid_amount=payment_sum.quantize(Decimal("0.01")),
+        due_amount=Decimal("0.00"),
+        notes=payload.notes or "Created via Exchange",
+        items=sale_items_unpacked,
+        payments=new_payments,
+        lab_status="Confirmed",
+    )
+    db.add(new_sale)
+    await db.flush()  # Assign new_sale.id
+
+    # Deduct inventory for new items
+    for sale_item, product, snapshot in sale_items_to_create:
+        if sale_item.inventory_id:
+            inventory = await db.scalar(
+                select(Inventory).where(Inventory.id == sale_item.inventory_id)
+            )
+        else:
+            inventory = await get_or_create_inventory(
+                db, "STORE", payload.store_id, sale_item.product_id
+            )
+            sale_item.inventory_id = inventory.id
+
+        if not inventory or inventory.available_quantity < sale_item.quantity:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Insufficient stock for replacement product {sale_item.product_id}.",
+            )
+
+        inventory.quantity -= sale_item.quantity
+        inventory.available_quantity -= sale_item.quantity
+        inventory.last_stock_out_at = _now()
+
+        exc_out_txn = InventoryTransaction(
+            inventory_id=inventory.id,
+            product_id=sale_item.product_id,
+            product_snapshot_id=snapshot.id,
+            unit_price=sale_item.unit_price,
+            total_value=sale_item.line_total,
+            transaction_type=TransactionType.EXCHANGE_OUT,
+            quantity=sale_item.quantity,
+            reference_id=new_sale.id,
+            remarks=f"Issued via Exchange",
+            created_by=payload.processed_by_id,
+        )
+        db.add(exc_out_txn)
+        await db.flush()
+
+        # Dynamically assign units based on store/admin owner type
+        target_owner_type = OwnerType.ADMIN if payload.store_id == admin_id or payload.store_id == 0 else OwnerType.STORE
+        await assign_units_to_sale_item(
+            db=db,
+            product_id=sale_item.product_id,
+            owner_type=target_owner_type,
+            owner_id=payload.store_id,
+            quantity=sale_item.quantity,
+            sale_item_id=sale_item.id,
+            specific_unit_skus=None
+        )
+
+    # ── 6. Create Exchange mapping records ──
+    first_exchange = None
+    for idx, (original_item, exchange_qty, item_credit) in enumerate(original_items):
+        exchange_number = await _generate_exchange_number(db, admin_id)
+        
+        item_new_total = new_items_total if idx == 0 else Decimal("0.00")
+        item_additional = additional_payment if idx == 0 else Decimal("0.00")
+        
+        exchange = Exchange(
+            exchange_number=exchange_number,
+            admin_id=admin_id,
+            store_id=payload.store_id,
+            customer_id=payload.customer_id,
+            original_sale_id=payload.original_sale_id,
+            original_sale_item_id=original_item.id,
+            new_sale_id=new_sale.id,
+            original_item_value=item_credit,
+            new_items_total=item_new_total,
+            exchange_credit=item_credit,
+            additional_payment=item_additional,
+            processed_by_type=payload.processed_by_type,
+            processed_by_id=payload.processed_by_id,
+            exchange_date=payload.exchange_date,
+            status=ExchangeStatus.COMPLETED,
+            reason=payload.reason,
+            notes=f"Exchanged Qty: {exchange_qty}/{original_item.quantity}. " + (payload.notes or ""),
+        )
+        db.add(exchange)
+        await db.flush()
+
+        # Conditional routing of returned products based on batch expiration
+        from models.inventory import AgingStage
+        original_batch = await db.scalar(
+            select(Inventory).where(Inventory.id == original_item.inventory_id)
+        )
+        if original_batch and original_batch.aging_stage == AgingStage.DEAD_STOCK:
+            # Create deadstock entry for returned item (expired/dead stock)
+            await create_deadstock_from_exchange(
+                db=db,
+                exchange=exchange,
+                original_item=original_item,
+                exchange_qty=exchange_qty,
+                admin_id=admin_id,
+                store_id=payload.store_id,
+            )
+        else:
+            # Restock returned item directly back to available inventory
+            await restock_returned_unit(
+                db=db,
+                original_item=original_item,
+                exchange_qty=exchange_qty,
+                admin_id=admin_id,
+                store_id=payload.store_id,
+            )
+
+        if idx == 0:
+            first_exchange = exchange
+
+
+    # Check if ALL items in original_sale are fully exchanged
+    sale_fully_exchanged = True
+    for item in original_sale.items:
+        stmt_exc = select(sa_func.coalesce(sa_func.sum(Exchange.original_item_value), 0)).where(
+            Exchange.original_sale_item_id == item.id,
+            Exchange.status == ExchangeStatus.COMPLETED,
+        )
+        total_exc_credit = (await db.execute(stmt_exc)).scalar() or Decimal("0")
+        unit_val = (item.line_total / Decimal(item.quantity)).quantize(Decimal("0.01"))
+        exchanged_qty = int(round(total_exc_credit / unit_val)) if unit_val > 0 else 0
+        if exchanged_qty < item.quantity:
+            sale_fully_exchanged = False
+            break
+
+    original_sale.is_exchanged = sale_fully_exchanged
+
+    # Create/update bill HTML for the new sale
+    await update_bill_for_sale(db, new_sale.id)
+
+    # Commit all changes atomically
+    await db.commit()
+    return await get_exchange(db, first_exchange.id)
+
+
+async def get_exchange(db: AsyncSession, exchange_id: int) -> Exchange | None:
+    """Fetch an exchange by ID with related entities loaded."""
+    stmt = (
+        select(Exchange)
+        .options(
+            selectinload(Exchange.customer),
+            selectinload(Exchange.store),
+            selectinload(Exchange.original_sale),
+            selectinload(Exchange.original_sale_item).selectinload(SaleItem.product),
+            selectinload(Exchange.original_sale_item).selectinload(SaleItem.product_snapshot),
+            selectinload(Exchange.new_sale).selectinload(Sale.items).selectinload(SaleItem.product),
+            selectinload(Exchange.new_sale).selectinload(Sale.items).selectinload(SaleItem.product_snapshot),
+            selectinload(Exchange.new_sale).selectinload(Sale.items).selectinload(SaleItem.assigned_units),
+            selectinload(Exchange.new_sale).selectinload(Sale.payments),
+        )
+        .where(Exchange.id == exchange_id)
+    )
+    result = await db.execute(stmt)
+    return result.scalar_one_or_none()
+
+
+async def list_exchanges(
+    db: AsyncSession,
+    admin_id: int,
+    store_id: int | None = None,
+    customer_id: int | None = None,
+    status_filter: str | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    search: str | None = None,
+    page: int = 1,
+    limit: int = 20,
+    paginate: bool = True,
+) -> tuple[list[Exchange], int]:
+    """List exchanges with filters, pagination, and search."""
+    from models.customer import Customer
+
+    conditions = [Exchange.admin_id == admin_id]
+    if store_id:
+        conditions.append(Exchange.store_id == store_id)
+    if customer_id:
+        conditions.append(Exchange.customer_id == customer_id)
+    if status_filter:
+        conditions.append(Exchange.status == status_filter.upper())
+    if date_from:
+        conditions.append(Exchange.exchange_date >= date_from)
+    if date_to:
+        conditions.append(Exchange.exchange_date <= date_to)
+
+    if search:
+        search_term = f"%{search.strip()}%"
+        # Search by exchange number, original sale invoice, or customer phone/name
+        customer_cond = exists = (
+            select(Customer.id)
+            .where(
+                Customer.id == Exchange.customer_id,
+                or_(
+                    Customer.first_name.ilike(search_term),
+                    Customer.last_name.ilike(search_term),
+                    Customer.phone.ilike(search_term),
+                ),
+            )
+            .exists()
+        )
+        conditions.append(
+            or_(
+                Exchange.exchange_number.ilike(search_term),
+                customer_cond,
+            )
+        )
+
+    # Count query
+    count_stmt = select(sa_func.count(Exchange.id)).where(*conditions)
+    total = (await db.execute(count_stmt)).scalar() or 0
+
+    # Data query
+    stmt = (
+        select(Exchange)
+        .options(
+            selectinload(Exchange.customer),
+            selectinload(Exchange.store),
+            selectinload(Exchange.original_sale),
+            selectinload(Exchange.original_sale_item),
+            selectinload(Exchange.new_sale),
+        )
+        .where(*conditions)
+        .order_by(Exchange.created_at.desc())
+    )
+
+    if paginate:
+        offset = (page - 1) * limit
+        stmt = stmt.offset(offset).limit(limit)
+
+    result = await db.execute(stmt)
+    exchanges = list(result.scalars().all())
+    return exchanges, total
+
+
+async def cancel_exchange(
+    db: AsyncSession,
+    exchange: Exchange,
+    cancelled_by: int,
+) -> Exchange:
+    """
+    Cancel an exchange and reverse inventory effects:
+    1. Cancel new sale (restores stock of new replacement items via RETURN).
+    2. Mark exchange status as CANCELLED.
+    3. Clean up associated deadstock items.
+
+    NOTE: No reversal is needed for the original returned items because
+    create_exchange does NOT increment active inventory (items go to deadstock).
+    """
+    if exchange.status == ExchangeStatus.CANCELLED:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Exchange is already cancelled.",
+        )
+
+    # 1. No reversal needed for original items — create_exchange no longer
+    # increments inventory via EXCHANGE_IN. Returned items go directly to
+    # deadstock, so there is no stock increment to reverse here.
+
+    # 2. Cancel the new Sale (this auto-restores inventory for the replacement items)
+    if exchange.new_sale_id:
+        new_sale = await db.scalar(
+            select(Sale)
+            .options(selectinload(Sale.items))
+            .where(Sale.id == exchange.new_sale_id)
+        )
+        if new_sale and new_sale.status != SaleStatus.CANCELLED:
+            # Revert inventory for each item of the new sale
+            for item in new_sale.items:
+                if item.inventory_id:
+                    inventory = await db.scalar(
+                        select(Inventory).where(Inventory.id == item.inventory_id)
+                    )
+                    if inventory:
+                        inventory.quantity += item.quantity
+                        inventory.available_quantity += item.quantity
+                        inventory.last_stock_in_at = _now()
+
+                        exc_out_rev = InventoryTransaction(
+                            inventory_id=inventory.id,
+                            product_id=item.product_id,
+                            product_snapshot_id=item.product_snapshot_id,
+                            unit_price=item.unit_price,
+                            total_value=item.line_total,
+                            transaction_type=TransactionType.RETURN,
+                            quantity=item.quantity,
+                            reference_id=new_sale.id,
+                            remarks=f"Reverse Exchange Out (Cancel EXC {exchange.exchange_number})",
+                            created_by=cancelled_by,
+                        )
+                        db.add(exc_out_rev)
+
+            new_sale.status = SaleStatus.CANCELLED
+            await update_bill_for_sale(db, new_sale.id)
+
+    # Check if there are other active completed exchanges for this original sale
+    other_excs_count = await db.scalar(
+        select(sa_func.count(Exchange.id)).where(
+            Exchange.original_sale_id == exchange.original_sale_id,
+            Exchange.status == ExchangeStatus.COMPLETED,
+            Exchange.id != exchange.id
+        )
+    )
+    if not other_excs_count:
+        original_sale = await db.scalar(
+            select(Sale).where(Sale.id == exchange.original_sale_id)
+        )
+        if original_sale:
+            original_sale.is_exchanged = False
+
+    # Clean up deadstock items associated with this exchange
+    await cancel_deadstock_for_exchange(db, exchange.id)
+
+    exchange.status = ExchangeStatus.CANCELLED
+    await db.commit()
+    await db.refresh(exchange)
+    return exchange
+
